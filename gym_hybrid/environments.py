@@ -1,11 +1,11 @@
 import numpy as np
-from typing import Tuple
+from typing import Tuple, Dict, Union
 from typing import Optional
 from collections import namedtuple
 
-import gym
-from gym import spaces
-from gym.utils import seeding
+import gymnasium as gym
+from gymnasium import spaces
+import pygame
 gym.logger.set_level(40)  # noqa
 
 from gym_hybrid.agents import BaseAgent
@@ -22,48 +22,78 @@ BREAK = 2
 Target = namedtuple('Target', ['x', 'y', 'radius'])
 
 
-class Action:
+# get the exact type and parameters of the action from a concatenated action (Sapce.Dict)
+class ActionConverter:
     """"
     Action class to store and standardize the action for the environment.
     """
-    def __init__(self, id_: int, parameters: list):
+    def __init__(self, action_setting: Dict):
         """"
-        Initialization of an action.
+        Initialization of an action converter.
 
         Args:
-            id_: The id of the selected action.
-            parameters: The parameters of an action.
+            action_space: The action space of the environment.
         """
-        self.id = id_
-        self.parameters = parameters
-
-    @property
-    def parameter(self) -> float:
+        self.n = len(action_setting)
+        self.parameters_min = []
+        self.parameters_max = []
+        for key in action_setting:
+            _params_min = []
+            _params_max = []
+            _params_min.append([action_setting[key][k][0] for k in action_setting[key]])
+            _params_max.append([action_setting[key][k][1] for k in action_setting[key]])
+            self.parameters_min.append(np.array(_params_min).flatten())
+            self.parameters_max.append(np.array(_params_max).flatten())
+                   
+    def gym_space_setting(self) -> spaces.Dict:
         """"
-        Property method to return the parameter related to the action selected.
+        Method to return the action space setting in Gym.
 
         Returns:
-            The parameter related to this action_id
+            The action space setting.
         """
-        if len(self.parameters) == 2:
-            return self.parameters[self.id]
-        else:
-            return self.parameters[0]
+        action_space_dic = {
+            'id': spaces.Discrete(self.n),
+        }
+
+        for i in range(self.n):
+            action_space_dic['parameters'+str(i)] = spaces.Box(self.parameters_min[i], self.parameters_max[i])
+
+        action_space = spaces.Dict(action_space_dic)
+
+        return action_space
+
+    def convert(self, action: Dict[str, Union[int, np.ndarray]]) -> Tuple[int, list]:
+        """"
+        Method to convert the action from the concatenated form to the separated form.
+
+        Args:
+            action: The concatenated action.
+
+        Returns:
+            The separated action.
+        """
+        id_ = action['id']
+        act_parameters_ = action['parameters'+str(id_)]
+        return id_, act_parameters_
 
 
 class BaseEnv(gym.Env):
     """"
     Gym environment parent class.
     """
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
+
     def __init__(
             self,
-            seed: Optional[int] = None,
+            render_mode = None,
             max_turn: float = np.pi/2,
             max_acceleration: float = 0.5,
             delta_t: float = 0.005,
             max_step: int = 200,
             penalty: float = 0.001,
             break_value: float = 0.1,
+            proximity_reward_scalar: float = 3.0,
     ):
         """Initialization of the gym environment.
 
@@ -87,26 +117,51 @@ class BaseEnv(gym.Env):
         self.field_size = 1.0
         self.target_radius = 0.1
         self.penalty = penalty
+        self.proximity_reward_scalar = proximity_reward_scalar
 
         # Initialization
-        self.seed(seed)
         self.target = None
-        self.viewer = None
+        assert render_mode is None or render_mode in self.metadata["render_modes"]
+        self.render_mode = render_mode
+        self.screen = None
+        self.clock = None
+        self.screen_width = 400
+        self.screen_height = 400
+        self.agent_radius = 0.05
         self.current_step = None
         self.agent = BaseAgent(break_value=break_value, delta_t=delta_t)
 
-        parameters_min = np.array([0, -1])
-        parameters_max = np.array([1, +1])
+        # parameters_min = np.array([0, -1])
+        # parameters_max = np.array([1, +1])
+        # self.action_space = spaces.Tuple((spaces.Discrete(3),
+        #                                   spaces.Box(parameters_min, parameters_max)))
+        parameterized_action_set = {
+            ACCELERATE: {
+                'acc': [0, 1]
+            },
+            TURN: {
+                'roa': [-1, 1]
+            },
+            BREAK: {}
+        }
 
-        self.action_space = spaces.Tuple((spaces.Discrete(3),
-                                          spaces.Box(parameters_min, parameters_max)))
-        self.observation_space = spaces.Box(np.ones(10), -np.ones(10))
+        # parameterized_action_set = {
+        #     ACCELERATE: {
+        #         'acc': [-1, 1] # normalized value
+        #     },
+        #     TURN: {
+        #         'roa': [-1, 1]
+        #     },
+        #     BREAK: {}
+        # }
 
-    def seed(self, seed: Optional[int] = None) -> list:
-        self.np_random, seed = seeding.np_random(seed)  # noqa
-        return [seed]
+        self.action_converter = ActionConverter(parameterized_action_set)
+        self.action_space = self.action_converter.gym_space_setting()
+        self.observation_space = spaces.Box(-np.ones(10), np.ones(10))
 
-    def reset(self) -> list:
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        super().reset(seed=seed)
+
         self.current_step = 0
 
         limit = self.field_size-self.target_radius
@@ -118,33 +173,42 @@ class BaseEnv(gym.Env):
         high = [self.field_size, self.field_size, 2 * np.pi]
         self.agent.reset(*self.np_random.uniform(low, high))
 
-        return self.get_state()
+        return self.get_state(), {}
 
-    def step(self, raw_action: Tuple[int, list]) -> Tuple[list, float, bool, dict]:
-        action = Action(*raw_action)
+    def step(self, raw_action: Dict[str, Union[int, np.ndarray]]):
+        id_, parameters_ = self.action_converter.convert(raw_action)
         last_distance = self.distance
         self.current_step += 1
 
-        if action.id == TURN:
-            rotation = self.max_turn * max(min(action.parameter, 1), -1)
+        if id_ == TURN:
+            rotation = self.max_turn * max(min(parameters_[0], 1), -1)
             self.agent.turn(rotation)
-        elif action.id == ACCELERATE:
-            acceleration = self.max_acceleration * max(min(action.parameter, 1), 0)
+        elif id_ == ACCELERATE:
+            # remap the acceleration from [-1, 1] to [0, 1]
+            # parameters_[0] = (parameters_[0] + 1) / 2
+            acceleration = self.max_acceleration * max(min(parameters_[0], 1), 0)
             self.agent.accelerate(acceleration)
-        elif action.id == BREAK:
+        elif id_ == BREAK:
             self.agent.break_()
 
         if self.distance < self.target_radius and self.agent.speed == 0:
             reward = self.get_reward(last_distance, True)
-            done = True
+            terminated = True
         elif abs(self.agent.x) > self.field_size or abs(self.agent.y) > self.field_size or self.current_step > self.max_step:
             reward = -1
-            done = True
+            terminated = True
         else:
             reward = self.get_reward(last_distance)
-            done = False
+            terminated = False
+        truncated = False
 
-        return self.get_state(), reward, done, {}
+        if self.render_mode is not None:
+            self.render()
+
+        # add info to the return 
+        info = {'reward': reward, 'terminated': terminated, 'truncated': truncated}
+
+        return self.get_state(), reward, terminated, truncated, info
 
     def get_state(self) -> list:
         state = [
@@ -162,62 +226,59 @@ class BaseEnv(gym.Env):
         return state
 
     def get_reward(self, last_distance: float, goal: bool = False) -> float:
-        return last_distance - self.distance - self.penalty + (1 if goal else 0)
+        return (last_distance - self.distance) * self.proximity_reward_scalar - self.penalty + (1 if goal else 0)
 
     @property
     def distance(self) -> float:
         return self.get_distance(self.agent.x, self.agent.y, self.target.x, self.target.y)
 
-    @staticmethod
+    @staticmethod   
     def get_distance(x1: float, y1: float, x2: float, y2: float) -> float:
         return np.sqrt(((x1 - x2) ** 2) + ((y1 - y2) ** 2))
 
-    def render(self, mode='human'):
-        screen_width = 400
-        screen_height = 400
-        unit_x = screen_width / 2
-        unit_y = screen_height / 2
-        agent_radius = 0.05
+    def render(self):
+        if self.render_mode is None:
+            return
 
-        if self.viewer is None:
-            from gym.envs.classic_control import rendering
-            self.viewer = rendering.Viewer(screen_width, screen_height)
+        if self.screen is None:
+            pygame.init()
+            self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
+            self.clock = pygame.time.Clock()
 
-            agent = rendering.make_circle(unit_x * agent_radius)
-            self.agent_trans = rendering.Transform(translation=(unit_x * (1 + self.agent.x), unit_y * (1 + self.agent.y)))  # noqa
-            agent.add_attr(self.agent_trans)
-            agent.set_color(0.1, 0.3, 0.9)
-            self.viewer.add_geom(agent)
+        self.screen.fill((255, 255, 255))  # White background
+        unit_x = self.screen_width // 2
+        unit_y = self.screen_height // 2
 
-            t, r, m = 0.1 * unit_x, 0.04 * unit_y, 0.06 * unit_x
-            arrow = rendering.FilledPolygon([(t, 0), (m, r), (m, -r)])
-            self.arrow_trans = rendering.Transform(rotation=self.agent.theta)  # noqa
-            arrow.add_attr(self.arrow_trans)
-            arrow.add_attr(self.agent_trans)
-            arrow.set_color(0, 0, 0)
-            self.viewer.add_geom(arrow)
+        # Draw agent as a circle
+        agent_position = (unit_x + int(self.agent.x * unit_x), unit_y + int(self.agent.y * unit_y))
+        pygame.draw.circle(self.screen, (26, 77, 230), agent_position, int(self.agent_radius * unit_x))
 
-            target = rendering.make_circle(unit_x * self.target_radius)
-            target_trans = rendering.Transform(translation=(unit_x * (1 + self.target.x), unit_y * (1 + self.target.y)))
-            target.add_attr(target_trans)
-            target.set_color(1, 0.5, 0.5)
-            self.viewer.add_geom(target)
+        # Draw target as a circle
+        target_position = (unit_x + int(self.target.x * unit_x), unit_y + int(self.target.y * unit_y))
+        pygame.draw.circle(self.screen, (255, 128, 128), target_position, int(self.target_radius * unit_x))
 
-        self.arrow_trans.set_rotation(self.agent.theta)
-        self.agent_trans.set_translation(unit_x * (1 + self.agent.x), unit_y * (1 + self.agent.y))
+        # Draw arrow indicating the agent's direction
+        arrow_length = 30
+        arrow_end = (agent_position[0] + arrow_length * np.cos(self.agent.theta),
+                     agent_position[1] + arrow_length * np.sin(self.agent.theta))
+        pygame.draw.line(self.screen, (0, 0, 0), agent_position, arrow_end, 3)
 
-        return self.viewer.render(return_rgb_array=mode == 'rgb_array')
-
+        if self.render_mode == 'human':
+            pygame.display.flip()
+            self.clock.tick(self.metadata["render_fps"])  # Limit to 60 FPS
+        elif self.render_mode == 'rgb_array':
+            return np.transpose(np.array(pygame.surfarray.pixels3d(self.screen)), axes=(1, 0, 2))
+            
     def close(self):
-        if self.viewer:
-            self.viewer.close()
-            self.viewer = None
+        if self.screen is not None:
+            pygame.quit()
+            self.screen = None
 
 
 class MovingEnv(BaseEnv):
     def __init__(
             self,
-            seed: int = None,
+            render_mode = None,
             max_turn: float = np.pi/2,
             max_acceleration: float = 0.5,
             delta_t: float = 0.005,
@@ -227,7 +288,7 @@ class MovingEnv(BaseEnv):
     ):
 
         super(MovingEnv, self).__init__(
-            seed=seed,
+            render_mode=render_mode,
             max_turn=max_turn,
             max_acceleration=max_acceleration,
             delta_t=delta_t,
@@ -245,7 +306,7 @@ class MovingEnv(BaseEnv):
 class SlidingEnv(BaseEnv):
     def __init__(
             self,
-            seed: int = None,
+            render_mode = None,
             max_turn: float = np.pi/2,
             max_acceleration: float = 0.5,
             delta_t: float = 0.005,
@@ -255,7 +316,7 @@ class SlidingEnv(BaseEnv):
     ):
 
         super(SlidingEnv, self).__init__(
-            seed=seed,
+            render_mode=render_mode,
             max_turn=max_turn,
             max_acceleration=max_acceleration,
             delta_t=delta_t,
