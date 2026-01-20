@@ -57,12 +57,13 @@ class ActionConverter:
         }
 
         for i in range(self.n):
-            action_space_dic['parameters'+str(i)] = spaces.Box(self.parameters_min[i], self.parameters_max[i])
+            action_space_dic['params'+str(i)] = spaces.Box(self.parameters_min[i], self.parameters_max[i])  # avoid use "parameters" name to avoid conflict with the nn.DictModule
 
         action_space = spaces.Dict(action_space_dic)
 
         return action_space
 
+    # get the exact type and parameters of the action from a concatenated action (Sapce.Dict)
     def convert(self, action: Dict[str, Union[int, np.ndarray]]) -> Tuple[int, list]:
         """"
         Method to convert the action from the concatenated form to the separated form.
@@ -74,7 +75,7 @@ class ActionConverter:
             The separated action.
         """
         id_ = action['id']
-        act_parameters_ = action['parameters'+str(id_)]
+        act_parameters_ = action['params'+str(id_)]
         return id_, act_parameters_
 
 
