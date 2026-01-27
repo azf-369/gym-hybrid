@@ -7,25 +7,16 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import gymnasium as gym
-import gymnasium.logger as gym_logger
 import imageio.v2 as imageio
 import argparse
 import glob
-
-if not hasattr(gym_logger, "set_level"):
-    if hasattr(gym_logger, "setLevel"):
-        gym_logger.set_level = gym_logger.setLevel
-    else:
-        gym_logger.set_level = lambda *_args, **_kwargs: None
-if not hasattr(gym.logger, "set_level"):
-    gym.logger.set_level = gym_logger.set_level
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import gym_hybrid
 
 
 ENV_ID = "Moving-v0"
-DEFAULT_DEMO_DIR = os.path.join(os.path.dirname(__file__))
+DEFAULT_DEMO_DIR = os.path.join(os.path.dirname(__file__), "data")
 DEFAULT_OUTPUT = os.path.join(os.path.dirname(__file__), "demo_vis.gif")
 MAX_FRAMES = 80
 
@@ -66,22 +57,12 @@ def main():
     env = gym.make(ENV_ID, render_mode="rgb_array")
     frames = []
 
-    # restore saved start/target if available
     obs, _ = env.reset()
-    if start is not None and getattr(start, 'size', True):
-        try:
-            env.unwrapped.agent.reset(float(start[0]), float(start[1]), float(start[2]))
-        except Exception:
-            pass
-    if target is not None and getattr(target, 'size', True):
-        try:
-            env.unwrapped.target = env.unwrapped.target._replace(x=float(target[0]), y=float(target[1]))
-        except Exception:
-            pass
-    try:
-        env.unwrapped.current_step = 0
-    except Exception:
-        pass
+    if start is not None and start.size:
+        env.unwrapped.agent.reset(float(start[0]), float(start[1]), float(start[2]))
+    if target is not None and target.size:
+        env.unwrapped.target = env.unwrapped.target._replace(x=float(target[0]), y=float(target[1]))
+    env.unwrapped.current_step = 0
 
     frames.append(env.render())
 

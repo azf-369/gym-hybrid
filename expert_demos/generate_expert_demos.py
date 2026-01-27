@@ -7,28 +7,15 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 import gymnasium as gym
-import gymnasium.logger as gym_logger
-
-if not hasattr(gym_logger, "set_level"):
-    if hasattr(gym_logger, "setLevel"):
-        gym_logger.set_level = gym_logger.setLevel
-    else:
-        gym_logger.set_level = lambda *_args, **_kwargs: None
-if not hasattr(gym.logger, "set_level"):
-    gym.logger.set_level = gym_logger.set_level
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import gym_hybrid
 
 
 ENV_ID = "Moving-v0"
-OUTPUT = os.path.join(os.path.dirname(__file__), "expert_demo.npz")
-EPISODES = 1
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_STEPS = 200
-
-TARGET_X, TARGET_Y = 0.5, 0.0
-START_X, START_Y = -0.5, 0.0
-START_THETA = 0.0
 
 
 def normalize_angle(angle: float) -> float:
@@ -55,52 +42,59 @@ def make_action(action_id: int, param_value: float, action_space):
 
 
 def concat_params(action, action_space):
-    params = []
-    for key, space in action_space.spaces.items():
-        if key == "id":
-            continue
-        params.append(action[key].astype(np.float32))
+    params = [action[k].astype(np.float32) for k in action_space.spaces.keys() if k != "id"]
     return np.concatenate(params) if params else np.zeros((0,), dtype=np.float32)
 
 
-def expert_policy(obs, target_radius):
+def expert_policy(obs, target_radius, env=None):
     agent_x, agent_y = obs[0], obs[1]
     speed = obs[2]
     cos_theta, sin_theta = obs[3], obs[4]
     target_x, target_y = obs[5], obs[6]
     distance = obs[7]
     in_target = obs[8] > 0.5
-
     heading = np.arctan2(sin_theta, cos_theta)
     desired = np.arctan2(target_y - agent_y, target_x - agent_x)
     delta = normalize_angle(desired - heading)
 
-    # If within the target region, always issue BREAK to come to rest and terminate
     if in_target or distance <= target_radius * 1.2:
         return 2, 0.0
-    if abs(delta) > 0.15:
+
+    angle_thresh = 0.05
+    if abs(delta) > angle_thresh:
         return 1, float(np.clip(delta / (np.pi / 2), -1.0, 1.0))
-    if distance > target_radius * 2.0:
+
+    # Adaptive stopping: use env params when available for accurate stopping distance
+    # Fallback to defaults otherwise
+    if env is not None:
+        break_value = float(env.unwrapped.break_value)
+        delta_t = float(env.unwrapped.delta_t)
+    else:
+        break_value = 0.1
+        delta_t = 0.005
+
+    # Estimate stopping distance by simulating repeated BREAK steps
+    est_stop_dist = 0.0
+    s = float(speed)
+    while s > 1e-6:
+        est_stop_dist += s * delta_t
+        s = max(0.0, s - break_value)
+
+    margin = max(0.05, target_radius)
+    hysteresis = 0.1
+
+    if distance <= est_stop_dist + margin:
+        return 2, 0.0
+    if distance > est_stop_dist + margin + hysteresis:
         return 0, 1.0
-    return 0, float(np.clip(distance * 2.0, 0.0, 0.3))
+    return 0, 0.0
 
 
 def run_episode(env):
-    # random reset (env chooses start and target)
-    try:
-        env.reset()
-    except TypeError:
-        env.reset()
-
-    # capture start and target for saving
-    try:
-        start = (float(env.unwrapped.agent.x), float(env.unwrapped.agent.y), float(env.unwrapped.agent.theta))
-    except Exception:
-        start = None
-    try:
-        target = (float(env.unwrapped.target.x), float(env.unwrapped.target.y))
-    except Exception:
-        target = None
+    # Reset environment and capture the initial start/target
+    env.reset()
+    start = (float(env.unwrapped.agent.x), float(env.unwrapped.agent.y), float(env.unwrapped.agent.theta))
+    target = (float(env.unwrapped.target.x), float(env.unwrapped.target.y))
 
     obs = env.unwrapped.get_state()
     obs_traj, ids, p0s, p1s, p2s, pcat = [], [], [], [], [], []
@@ -109,7 +103,7 @@ def run_episode(env):
     success = False
 
     while not done and steps < MAX_STEPS:
-        action_id, param = expert_policy(obs, env.unwrapped.target_radius)
+        action_id, param = expert_policy(obs, env.unwrapped.target_radius, env)
         action = make_action(action_id, param, env.action_space)
         obs_traj.append(obs)
         ids.append(action_id)
@@ -133,7 +127,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", "-n", type=int, default=1, help="number of successful demos to collect")
     parser.add_argument("--seed", type=int, default=None, help="optional seed for reproducibility")
-    parser.add_argument("--output-dir", type=str, default=os.path.dirname(__file__), help="where to save demo files")
+    parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR, help="where to save demo files")
     parser.add_argument("--max-attempts", type=int, default=10, help="max attempts per demo")
 
     args = parser.parse_args()
@@ -152,6 +146,8 @@ def main():
         if not ok:
             continue
 
+        # create output dir if it does not exist
+        os.makedirs(args.output_dir, exist_ok=True)
         out_name = os.path.join(args.output_dir, f"expert_demo_{success}.npz")
         np.savez(
             out_name,
